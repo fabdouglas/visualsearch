@@ -1,0 +1,52 @@
+/*
+ * PEG.js grammar file
+ * http://pegjs.majda.cz/online
+ *
+ * For example, the string
+ *
+ * metro: "25 Ave" "facility": "Haircut"(15)
+ *
+ * is parsed into
+ *
+ *    [
+ *      {
+ *        "category": "metro",
+ *        "label": "25 Ave",
+ *        "value": "25 Ave"
+ *      },
+ *      {
+ *        "category": " facility",
+ *         "label": "Haircut",
+ *        "value": "15"
+ *      }
+ *    ]
+ */
+
+start
+  = facets:facet* { return facets; }
+
+facet
+  = ' '* category:category ":" " "* label:label value:value? " "* {return {category: category, label: label, value: value || label}; }
+
+category
+  = squoted
+  / dquoted
+  / plain
+
+label
+  = squoted
+  / dquoted
+  / plain
+
+value
+  = '(' v:plain ')' { return v; }
+
+
+squoted
+  = "'" t:[^\']+ "'" { return t.join(''); }
+
+dquoted
+  = '"' t:[^\"]+ '"' { return t.join(''); }
+
+plain
+  = t:[^(:) "]+ { return t.join(''); }

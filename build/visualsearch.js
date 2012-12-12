@@ -44,6 +44,9 @@
     };
     this.options           = _.extend({}, defaults, options);
     this.options.callbacks = _.extend({}, defaults.callbacks, options.callbacks);
+    _.each(_.functions(this.options.callbacks), _.bind(function(f) {
+      this.options.callbacks[f] = _.bind(this.options.callbacks[f], this);
+    }, this));
     
     VS.app.hotkeys.initialize();
     this.searchQuery   = new VS.model.SearchQuery();
@@ -186,28 +189,32 @@ VS.ui.SearchBox = Backbone.View.extend({
 
   // Add a new facet. Facet will be focused and ready to accept a value. Can also
   // specify position, in the case of adding facets from an inbetween input.
-  addFacet : function(category, initialQuery, position) {
-    category     = VS.utils.inflector.trim(category);
-    initialQuery = VS.utils.inflector.trim(initialQuery || '');
-    if (!category) return;
+  addFacet : function(facetOptions, position, options) {
+    options      = options || {};
+    if (!facetOptions.category) return;
     
-    var model = new VS.model.SearchFacet({
-      category : category,
-      value    : initialQuery || '',
-      app      : this.app
-    });
-    this.app.searchQuery.add(model, {at: position});
+    var model = new VS.model.SearchFacet(_.extend({
+      app : this.app
+    }, facetOptions));
+    this.app.searchQuery.add(model, $.extend({at: position}, options));
   },
 
   // Renders a newly added facet, and selects it.
-  addedFacet : function (model) {
+  addedFacet : function (model, collection, options) {
+    options = options || {};
     this.renderFacets();
-    var facetView = _.detect(this.facetViews, function(view) {
-      if (view.model == model) return true;
-    });
+    var view;
+    if (options.skipEdit) {
+      this.searchEvent();
+      view = this.inputViews[this.inputViews.length-1];
+    } else {
+      view = _.detect(this.facetViews, function(view) {
+        if (view.model == model) return true;
+      });
+    }
 
     _.defer(function() {
-      facetView.enableEdit();
+      view.enableEdit();
     });
   },
 
@@ -440,7 +447,7 @@ VS.ui.SearchBox = Backbone.View.extend({
     var view = this.inputViews[this.inputViews.length-1];
     view.enableEdit(selectText);
     if (!selectText) view.setCursorAtEnd(-1);
-    if (e.type == 'keydown') {
+    if (e && e.type == 'keydown') {
       view.keydown(e);
       view.box.trigger('keydown');
     }
@@ -549,7 +556,7 @@ VS.ui.SearchFacet = Backbone.View.extend({
     this.setMode('not', 'editing');
     this.setMode('not', 'selected');
     this.box = this.$('input');
-    this.box.val(this.model.get('value'));
+    this.box.val(this.model.label());
     this.box.bind('blur', this.deferDisableEdit);
     // Handle paste events with `propertychange`
     this.box.bind('input propertychange', this.keydown);
@@ -589,15 +596,21 @@ VS.ui.SearchFacet = Backbone.View.extend({
       }, this),
       select    : _.bind(function(e, ui) {
         e.preventDefault();
-        var originalValue = this.model.get('value');
-        this.set(ui.item.value);
-        if (originalValue != ui.item.value || this.box.val() != ui.item.value) {
+        var originalValue = this.model.value();
+        this.set(ui.item.value, ui.item.label);
+        if (originalValue != ui.item.value || this.box.val() != (ui.item.label || ui.item.value)) {
           if (this.options.app.options.autosearch) {
             this.search(e);
           }
         }
         return false;
       }, this),
+      focus     : function(event, ui) {
+        if ( /^key/.test(event.originalEvent.type) ) {
+          $(this).val(ui.item.label || ui.item.value);
+        }
+        return false;
+      },
       open      : _.bind(function(e, ui) {
         var box = this.box;
         this.box.autocomplete('widget').find('.ui-menu-item').each(function() {
@@ -658,8 +671,8 @@ VS.ui.SearchFacet = Backbone.View.extend({
   // value's own category. You can pass `preserveOrder` as an option in the 
   // `facetMatches` callback to skip any further ordering done client-side.
   autocompleteValues : function(req, resp) {
-    var category = this.model.get('category');
-    var value    = this.model.get('value');
+    var category = this.model.category();
+    var value    = this.model.value();
     var searchTerm = req.term;
 
     this.options.app.options.callbacks.valueMatches(category, searchTerm, function(matches, options) {
@@ -693,9 +706,9 @@ VS.ui.SearchFacet = Backbone.View.extend({
   },
 
   // Sets the facet's model's value.
-  set : function(value) {
+  set : function(value, label) {
     if (!value) return;
-    this.model.set({'value': value});
+    this.model.set({'value': value, 'label': label || value});
   },
 
   // Before the searchBox performs a search, we need to close the
@@ -719,7 +732,7 @@ VS.ui.SearchFacet = Backbone.View.extend({
       this.setMode('is', 'editing');
       this.deselectFacet();
       if (this.box.val() == '') {
-        this.box.val(this.model.get('value'));
+        this.box.val(this.model.label());
       }
     }
 
@@ -756,7 +769,7 @@ VS.ui.SearchFacet = Backbone.View.extend({
   // the autocomplete menu.
   disableEdit : function() {
     var newFacetQuery = VS.utils.inflector.trim(this.box.val());
-    if (newFacetQuery != this.model.get('value')) {
+    if (newFacetQuery != this.model.label()) {
       this.set(newFacetQuery);
     }
     this.flags.canClose = false;
@@ -843,7 +856,7 @@ VS.ui.SearchFacet = Backbone.View.extend({
 
   // Deletes the facet and sends the cursor over to the nearest input field.
   remove : function(e) {
-    var committed = this.model.get('value');
+    var committed = this.model.value();
     this.deselectFacet();
     this.disableEdit();
     this.options.app.searchQuery.remove(this.model);
@@ -995,7 +1008,16 @@ VS.ui.SearchInput = Backbone.View.extend({
         e.stopPropagation();
         //var remainder = this.addTextFacetRemainder(ui.item.value);
         var position  = this.options.position; // + (remainder ? 1 : 0);
-        this.app.searchBox.addFacet(ui.item instanceof String ? ui.item : ui.item.value, '', position);
+        if (ui.item instanceof String) {
+          this.app.searchBox.addFacet({category: ui.item}, position);
+        } else {
+          var selectedValue = ui.item.initialValue && (ui.item.initialValue.value.toString() || ui.item.initialValue) || '';
+          this.app.searchBox.addFacet({
+              category: ui.item.value,
+              value: selectedValue,
+              label: ui.item.initialValue && (ui.item.initialValue.label || ui.item.initialValue) || ''
+            }, position, {skipEdit: selectedValue.length > 0});
+        }
         return false;
       }, this)
     });
@@ -1029,7 +1051,7 @@ VS.ui.SearchInput = Backbone.View.extend({
 
       // Only match from the beginning of the word.
       var matcher    = new RegExp('^' + re, 'i');
-      var matches    = $.grep(prefixes, function(item) {
+      var matches    = options.noGrep ? prefixes : $.grep(prefixes, function(item) {
         return item && matcher.test(item.label || item);
       });
 
@@ -1041,7 +1063,7 @@ VS.ui.SearchInput = Backbone.View.extend({
           else             return match;
         }));
       }
-    });
+    }, searchTerm);
 
   },
 
@@ -1103,7 +1125,7 @@ VS.ui.SearchInput = Backbone.View.extend({
     boxValue = boxValue.replace('^\s+|\s+$', '');
     
     if (boxValue) {
-      this.app.searchBox.addFacet(this.app.options.remainder, boxValue, this.options.position);
+      this.app.searchBox.addFacet({category: this.app.options.remainder, value: boxValue}, this.options.position);
     }
     
     return boxValue;
@@ -1254,7 +1276,7 @@ VS.ui.SearchInput = Backbone.View.extend({
         e.preventDefault();
         var remainder = this.addTextFacetRemainder(query);
         var position  = this.options.position + (remainder?1:0);
-        this.app.searchBox.addFacet(query, '', position);
+        this.app.searchBox.addFacet({category: query}, position);
         return false;
       }
     } else if (key == 'backspace') {
@@ -1293,7 +1315,7 @@ VS.ui.SearchInput = Backbone.View.extend({
       if (value.length) {
         var remainder = this.addTextFacetRemainder(value);
         var position  = this.options.position + (remainder?1:0);
-        this.app.searchBox.addFacet(value, '', position);
+        this.app.searchBox.addFacet({category: value}, position);
       } else {
         this.app.searchBox.focusNextFacet(this, 0, {
           skipToFacet: true,
@@ -1326,6 +1348,655 @@ VS.ui.SearchInput = Backbone.View.extend({
 
 })();
 
+VS.app.GrammarParser = (function(){
+  /*
+   * Generated by PEG.js 0.7.0.
+   *
+   * http://pegjs.majda.cz/
+   */
+  
+  function quote(s) {
+    /*
+     * ECMA-262, 5th ed., 7.8.4: All characters may appear literally in a
+     * string literal except for the closing quote character, backslash,
+     * carriage return, line separator, paragraph separator, and line feed.
+     * Any character may appear in the form of an escape sequence.
+     *
+     * For portability, we also escape escape all control and non-ASCII
+     * characters. Note that "\0" and "\v" escape sequences are not used
+     * because JSHint does not like the first and IE the second.
+     */
+     return '"' + s
+      .replace(/\\/g, '\\\\')  // backslash
+      .replace(/"/g, '\\"')    // closing quote character
+      .replace(/\x08/g, '\\b') // backspace
+      .replace(/\t/g, '\\t')   // horizontal tab
+      .replace(/\n/g, '\\n')   // line feed
+      .replace(/\f/g, '\\f')   // form feed
+      .replace(/\r/g, '\\r')   // carriage return
+      .replace(/[\x00-\x07\x0B\x0E-\x1F\x80-\uFFFF]/g, escape)
+      + '"';
+  }
+  
+  var result = {
+    /*
+     * Parses the input with a generated parser. If the parsing is successfull,
+     * returns a value explicitly or implicitly specified by the grammar from
+     * which the parser was generated (see |PEG.buildParser|). If the parsing is
+     * unsuccessful, throws |PEG.parser.SyntaxError| describing the error.
+     */
+    parse: function(input, startRule) {
+      var parseFunctions = {
+        "start": parse_start,
+        "facet": parse_facet,
+        "category": parse_category,
+        "label": parse_label,
+        "value": parse_value,
+        "squoted": parse_squoted,
+        "dquoted": parse_dquoted,
+        "plain": parse_plain
+      };
+      
+      if (startRule !== undefined) {
+        if (parseFunctions[startRule] === undefined) {
+          throw new Error("Invalid rule name: " + quote(startRule) + ".");
+        }
+      } else {
+        startRule = "start";
+      }
+      
+      var pos = 0;
+      var reportFailures = 0;
+      var rightmostFailuresPos = 0;
+      var rightmostFailuresExpected = [];
+      
+      function padLeft(input, padding, length) {
+        var result = input;
+        
+        var padLength = length - input.length;
+        for (var i = 0; i < padLength; i++) {
+          result = padding + result;
+        }
+        
+        return result;
+      }
+      
+      function escape(ch) {
+        var charCode = ch.charCodeAt(0);
+        var escapeChar;
+        var length;
+        
+        if (charCode <= 0xFF) {
+          escapeChar = 'x';
+          length = 2;
+        } else {
+          escapeChar = 'u';
+          length = 4;
+        }
+        
+        return '\\' + escapeChar + padLeft(charCode.toString(16).toUpperCase(), '0', length);
+      }
+      
+      function matchFailed(failure) {
+        if (pos < rightmostFailuresPos) {
+          return;
+        }
+        
+        if (pos > rightmostFailuresPos) {
+          rightmostFailuresPos = pos;
+          rightmostFailuresExpected = [];
+        }
+        
+        rightmostFailuresExpected.push(failure);
+      }
+      
+      function parse_start() {
+        var result0, result1;
+        var pos0;
+        
+        pos0 = pos;
+        result0 = [];
+        result1 = parse_facet();
+        while (result1 !== null) {
+          result0.push(result1);
+          result1 = parse_facet();
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, facets) { return facets; })(pos0, result0);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      function parse_facet() {
+        var result0, result1, result2, result3, result4, result5, result6, result7;
+        var pos0, pos1;
+        
+        pos0 = pos;
+        pos1 = pos;
+        result0 = [];
+        if (input.charCodeAt(pos) === 32) {
+          result1 = " ";
+          pos++;
+        } else {
+          result1 = null;
+          if (reportFailures === 0) {
+            matchFailed("\" \"");
+          }
+        }
+        while (result1 !== null) {
+          result0.push(result1);
+          if (input.charCodeAt(pos) === 32) {
+            result1 = " ";
+            pos++;
+          } else {
+            result1 = null;
+            if (reportFailures === 0) {
+              matchFailed("\" \"");
+            }
+          }
+        }
+        if (result0 !== null) {
+          result1 = parse_category();
+          if (result1 !== null) {
+            if (input.charCodeAt(pos) === 58) {
+              result2 = ":";
+              pos++;
+            } else {
+              result2 = null;
+              if (reportFailures === 0) {
+                matchFailed("\":\"");
+              }
+            }
+            if (result2 !== null) {
+              result3 = [];
+              if (input.charCodeAt(pos) === 32) {
+                result4 = " ";
+                pos++;
+              } else {
+                result4 = null;
+                if (reportFailures === 0) {
+                  matchFailed("\" \"");
+                }
+              }
+              while (result4 !== null) {
+                result3.push(result4);
+                if (input.charCodeAt(pos) === 32) {
+                  result4 = " ";
+                  pos++;
+                } else {
+                  result4 = null;
+                  if (reportFailures === 0) {
+                    matchFailed("\" \"");
+                  }
+                }
+              }
+              if (result3 !== null) {
+                result4 = parse_label();
+                if (result4 !== null) {
+                  result5 = parse_value();
+                  result5 = result5 !== null ? result5 : "";
+                  if (result5 !== null) {
+                    result6 = [];
+                    if (input.charCodeAt(pos) === 32) {
+                      result7 = " ";
+                      pos++;
+                    } else {
+                      result7 = null;
+                      if (reportFailures === 0) {
+                        matchFailed("\" \"");
+                      }
+                    }
+                    while (result7 !== null) {
+                      result6.push(result7);
+                      if (input.charCodeAt(pos) === 32) {
+                        result7 = " ";
+                        pos++;
+                      } else {
+                        result7 = null;
+                        if (reportFailures === 0) {
+                          matchFailed("\" \"");
+                        }
+                      }
+                    }
+                    if (result6 !== null) {
+                      result0 = [result0, result1, result2, result3, result4, result5, result6];
+                    } else {
+                      result0 = null;
+                      pos = pos1;
+                    }
+                  } else {
+                    result0 = null;
+                    pos = pos1;
+                  }
+                } else {
+                  result0 = null;
+                  pos = pos1;
+                }
+              } else {
+                result0 = null;
+                pos = pos1;
+              }
+            } else {
+              result0 = null;
+              pos = pos1;
+            }
+          } else {
+            result0 = null;
+            pos = pos1;
+          }
+        } else {
+          result0 = null;
+          pos = pos1;
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, category, label, value) {return {category: category, label: label, value: value || label}; })(pos0, result0[1], result0[4], result0[5]);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      function parse_category() {
+        var result0;
+        
+        result0 = parse_squoted();
+        if (result0 === null) {
+          result0 = parse_dquoted();
+          if (result0 === null) {
+            result0 = parse_plain();
+          }
+        }
+        return result0;
+      }
+      
+      function parse_label() {
+        var result0;
+        
+        result0 = parse_squoted();
+        if (result0 === null) {
+          result0 = parse_dquoted();
+          if (result0 === null) {
+            result0 = parse_plain();
+          }
+        }
+        return result0;
+      }
+      
+      function parse_value() {
+        var result0, result1, result2;
+        var pos0, pos1;
+        
+        pos0 = pos;
+        pos1 = pos;
+        if (input.charCodeAt(pos) === 40) {
+          result0 = "(";
+          pos++;
+        } else {
+          result0 = null;
+          if (reportFailures === 0) {
+            matchFailed("\"(\"");
+          }
+        }
+        if (result0 !== null) {
+          result1 = parse_plain();
+          if (result1 !== null) {
+            if (input.charCodeAt(pos) === 41) {
+              result2 = ")";
+              pos++;
+            } else {
+              result2 = null;
+              if (reportFailures === 0) {
+                matchFailed("\")\"");
+              }
+            }
+            if (result2 !== null) {
+              result0 = [result0, result1, result2];
+            } else {
+              result0 = null;
+              pos = pos1;
+            }
+          } else {
+            result0 = null;
+            pos = pos1;
+          }
+        } else {
+          result0 = null;
+          pos = pos1;
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, v) { return v; })(pos0, result0[1]);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      function parse_squoted() {
+        var result0, result1, result2;
+        var pos0, pos1;
+        
+        pos0 = pos;
+        pos1 = pos;
+        if (input.charCodeAt(pos) === 39) {
+          result0 = "'";
+          pos++;
+        } else {
+          result0 = null;
+          if (reportFailures === 0) {
+            matchFailed("\"'\"");
+          }
+        }
+        if (result0 !== null) {
+          if (/^[^']/.test(input.charAt(pos))) {
+            result2 = input.charAt(pos);
+            pos++;
+          } else {
+            result2 = null;
+            if (reportFailures === 0) {
+              matchFailed("[^']");
+            }
+          }
+          if (result2 !== null) {
+            result1 = [];
+            while (result2 !== null) {
+              result1.push(result2);
+              if (/^[^']/.test(input.charAt(pos))) {
+                result2 = input.charAt(pos);
+                pos++;
+              } else {
+                result2 = null;
+                if (reportFailures === 0) {
+                  matchFailed("[^']");
+                }
+              }
+            }
+          } else {
+            result1 = null;
+          }
+          if (result1 !== null) {
+            if (input.charCodeAt(pos) === 39) {
+              result2 = "'";
+              pos++;
+            } else {
+              result2 = null;
+              if (reportFailures === 0) {
+                matchFailed("\"'\"");
+              }
+            }
+            if (result2 !== null) {
+              result0 = [result0, result1, result2];
+            } else {
+              result0 = null;
+              pos = pos1;
+            }
+          } else {
+            result0 = null;
+            pos = pos1;
+          }
+        } else {
+          result0 = null;
+          pos = pos1;
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, t) { return t.join(''); })(pos0, result0[1]);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      function parse_dquoted() {
+        var result0, result1, result2;
+        var pos0, pos1;
+        
+        pos0 = pos;
+        pos1 = pos;
+        if (input.charCodeAt(pos) === 34) {
+          result0 = "\"";
+          pos++;
+        } else {
+          result0 = null;
+          if (reportFailures === 0) {
+            matchFailed("\"\\\"\"");
+          }
+        }
+        if (result0 !== null) {
+          if (/^[^"]/.test(input.charAt(pos))) {
+            result2 = input.charAt(pos);
+            pos++;
+          } else {
+            result2 = null;
+            if (reportFailures === 0) {
+              matchFailed("[^\"]");
+            }
+          }
+          if (result2 !== null) {
+            result1 = [];
+            while (result2 !== null) {
+              result1.push(result2);
+              if (/^[^"]/.test(input.charAt(pos))) {
+                result2 = input.charAt(pos);
+                pos++;
+              } else {
+                result2 = null;
+                if (reportFailures === 0) {
+                  matchFailed("[^\"]");
+                }
+              }
+            }
+          } else {
+            result1 = null;
+          }
+          if (result1 !== null) {
+            if (input.charCodeAt(pos) === 34) {
+              result2 = "\"";
+              pos++;
+            } else {
+              result2 = null;
+              if (reportFailures === 0) {
+                matchFailed("\"\\\"\"");
+              }
+            }
+            if (result2 !== null) {
+              result0 = [result0, result1, result2];
+            } else {
+              result0 = null;
+              pos = pos1;
+            }
+          } else {
+            result0 = null;
+            pos = pos1;
+          }
+        } else {
+          result0 = null;
+          pos = pos1;
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, t) { return t.join(''); })(pos0, result0[1]);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      function parse_plain() {
+        var result0, result1;
+        var pos0;
+        
+        pos0 = pos;
+        if (/^[^(:) "]/.test(input.charAt(pos))) {
+          result1 = input.charAt(pos);
+          pos++;
+        } else {
+          result1 = null;
+          if (reportFailures === 0) {
+            matchFailed("[^(:) \"]");
+          }
+        }
+        if (result1 !== null) {
+          result0 = [];
+          while (result1 !== null) {
+            result0.push(result1);
+            if (/^[^(:) "]/.test(input.charAt(pos))) {
+              result1 = input.charAt(pos);
+              pos++;
+            } else {
+              result1 = null;
+              if (reportFailures === 0) {
+                matchFailed("[^(:) \"]");
+              }
+            }
+          }
+        } else {
+          result0 = null;
+        }
+        if (result0 !== null) {
+          result0 = (function(offset, t) { return t.join(''); })(pos0, result0);
+        }
+        if (result0 === null) {
+          pos = pos0;
+        }
+        return result0;
+      }
+      
+      
+      function cleanupExpected(expected) {
+        expected.sort();
+        
+        var lastExpected = null;
+        var cleanExpected = [];
+        for (var i = 0; i < expected.length; i++) {
+          if (expected[i] !== lastExpected) {
+            cleanExpected.push(expected[i]);
+            lastExpected = expected[i];
+          }
+        }
+        return cleanExpected;
+      }
+      
+      function computeErrorPosition() {
+        /*
+         * The first idea was to use |String.split| to break the input up to the
+         * error position along newlines and derive the line and column from
+         * there. However IE's |split| implementation is so broken that it was
+         * enough to prevent it.
+         */
+        
+        var line = 1;
+        var column = 1;
+        var seenCR = false;
+        
+        for (var i = 0; i < Math.max(pos, rightmostFailuresPos); i++) {
+          var ch = input.charAt(i);
+          if (ch === "\n") {
+            if (!seenCR) { line++; }
+            column = 1;
+            seenCR = false;
+          } else if (ch === "\r" || ch === "\u2028" || ch === "\u2029") {
+            line++;
+            column = 1;
+            seenCR = true;
+          } else {
+            column++;
+            seenCR = false;
+          }
+        }
+        
+        return { line: line, column: column };
+      }
+      
+      
+      var result = parseFunctions[startRule]();
+      
+      /*
+       * The parser is now in one of the following three states:
+       *
+       * 1. The parser successfully parsed the whole input.
+       *
+       *    - |result !== null|
+       *    - |pos === input.length|
+       *    - |rightmostFailuresExpected| may or may not contain something
+       *
+       * 2. The parser successfully parsed only a part of the input.
+       *
+       *    - |result !== null|
+       *    - |pos < input.length|
+       *    - |rightmostFailuresExpected| may or may not contain something
+       *
+       * 3. The parser did not successfully parse any part of the input.
+       *
+       *   - |result === null|
+       *   - |pos === 0|
+       *   - |rightmostFailuresExpected| contains at least one failure
+       *
+       * All code following this comment (including called functions) must
+       * handle these states.
+       */
+      if (result === null || pos !== input.length) {
+        var offset = Math.max(pos, rightmostFailuresPos);
+        var found = offset < input.length ? input.charAt(offset) : null;
+        var errorPosition = computeErrorPosition();
+        
+        throw new this.SyntaxError(
+          cleanupExpected(rightmostFailuresExpected),
+          found,
+          offset,
+          errorPosition.line,
+          errorPosition.column
+        );
+      }
+      
+      return result;
+    },
+    
+    /* Returns the parser source code. */
+    toSource: function() { return this._source; }
+  };
+  
+  /* Thrown when a parser encounters a syntax error. */
+  
+  result.SyntaxError = function(expected, found, offset, line, column) {
+    function buildMessage(expected, found) {
+      var expectedHumanized, foundHumanized;
+      
+      switch (expected.length) {
+        case 0:
+          expectedHumanized = "end of input";
+          break;
+        case 1:
+          expectedHumanized = expected[0];
+          break;
+        default:
+          expectedHumanized = expected.slice(0, expected.length - 1).join(", ")
+            + " or "
+            + expected[expected.length - 1];
+      }
+      
+      foundHumanized = found ? quote(found) : "end of input";
+      
+      return "Expected " + expectedHumanized + " but " + foundHumanized + " found.";
+    }
+    
+    this.name = "SyntaxError";
+    this.expected = expected;
+    this.found = found;
+    this.message = buildMessage(expected, found);
+    this.offset = offset;
+    this.line = line;
+    this.column = column;
+  };
+  
+  result.SyntaxError.prototype = Error.prototype;
+  
+  return result;
+})();
 (function(){
 
   var $ = jQuery; // Handle namespaced jQuery
@@ -1452,6 +2123,7 @@ VS.utils.inflector = {
 
   // Delegate to the ECMA5 String.prototype.trim function, if available.
   trim : function(s) {
+    s = (s && s.toString()) || '';
     return s.trim ? s.trim() : s.replace(/^\s+|\s+$/g, '');
   },
   
@@ -1665,85 +2337,21 @@ if ($.browser.msie && false) {
 
 var $ = jQuery; // Handle namespaced jQuery
 
-// Used to extract keywords and facets from the free text search.
-var QUOTES_RE   = "('[^']+'|\"[^\"]+\")";
-var FREETEXT_RE = "('[^']+'|\"[^\"]+\"|[^'\"\\s]\\S*)";
-var CATEGORY_RE = FREETEXT_RE +                     ':\\s*';
 VS.app.SearchParser = {
-
-  // Matches `category: "free text"`, with and without quotes.
-  ALL_FIELDS : new RegExp(CATEGORY_RE + FREETEXT_RE, 'g'),
-
-  // Matches a single category without the text. Used to correctly extract facets.
-  CATEGORY   : new RegExp(CATEGORY_RE),
 
   // Called to parse a query into a collection of `SearchFacet` models.
   parse : function(instance, query) {
-    var searchFacets = this._extractAllFacets(instance, query);
-    instance.searchQuery.reset(searchFacets);
-    return searchFacets;
-  },
-
-  // Walks the query and extracts facets, categories, and free text.
-  _extractAllFacets : function(instance, query) {
-    var facets = [];
-    var originalQuery = query;
-
-    while (query) {
-      var category, value;
-      originalQuery = query;
-      var field = this._extractNextField(query);
-      if (!field) {
-        category = instance.options.remainder;
-        value    = this._extractSearchText(query);
-        query    = VS.utils.inflector.trim(query.replace(value, ''));
-      } else if (field.indexOf(':') != -1) {
-        category = field.match(this.CATEGORY)[1].replace(/(^['"]|['"]$)/g, '');
-        value    = field.replace(this.CATEGORY, '').replace(/(^['"]|['"]$)/g, '');
-        query    = VS.utils.inflector.trim(query.replace(field, ''));
-      } else if (field.indexOf(':') == -1) {
-        category = instance.options.remainder;
-        value    = field;
-        query    = VS.utils.inflector.trim(query.replace(value, ''));
-      }
-
-      if (category && value) {
-          var searchFacet = new VS.model.SearchFacet({
-            category : category,
-            value    : VS.utils.inflector.trim(value),
-            app      : instance
-          });
-          facets.push(searchFacet);
-      }
-      if (originalQuery == query) break;
-    }
-
+    var parsedQuery = VS.app.GrammarParser.parse(query),
+        facets = $.map(parsedQuery, function(fparams) {
+      return new VS.model.SearchFacet({
+          category  : fparams.category,
+          label     : VS.utils.inflector.trim(fparams.label || fparams.value),
+          value     : fparams.value,
+          app       : instance
+        })
+    })
+    instance.searchQuery.reset(facets);
     return facets;
-  },
-
-  // Extracts the first field found, capturing any free text that comes
-  // before the category.
-  _extractNextField : function(query) {
-    var textRe = new RegExp('^\\s*(\\S+)\\s+(?=' + QUOTES_RE + FREETEXT_RE + ')');
-    var textMatch = query.match(textRe);
-    if (textMatch && textMatch.length >= 1) {
-      return textMatch[1];
-    } else {
-      return this._extractFirstField(query);
-    }
-  },
-
-  // If there is no free text before the facet, extract the category and value.
-  _extractFirstField : function(query) {
-    var fields = query.match(this.ALL_FIELDS);
-    return fields && fields.length && fields[0];
-  },
-
-  // If the found match is not a category and facet, extract the trimmed free text.
-  _extractSearchText : function(query) {
-    query = query || '';
-    var text = VS.utils.inflector.trim(query.replace(this.ALL_FIELDS, ''));
-    return text;
   }
 
 };
@@ -1758,26 +2366,40 @@ var $ = jQuery; // Handle namespaced jQuery
 // Held in a collection by `VS.app.searchQuery`.
 VS.model.SearchFacet = Backbone.Model.extend({
 
+  category: function() {
+    return this.get('category');
+  },
+
+  label: function() {
+    return this.get('label') || this.value();
+  },
+  
+  value: function() {
+    return this.get('value');
+  },
+
   // Extract the category and value and serialize it in preparation for
   // turning the entire searchBox into a search query that can be sent
   // to the server for parsing and searching.
   serialize : function() {
-    var category = this.quoteCategory(this.get('category'));
-    var value    = VS.utils.inflector.trim(this.get('value'));
-    var remainder = this.get("app").options.remainder;
+    var category = this.quoteCategory(this.category()),
+        value    = VS.utils.inflector.trim(this.value());
 
     if (!value) return '';
 
-    if (!_.contains(this.get("app").options.unquotable || [], category) && category != remainder) {
-      value = this.quoteValue(value);
-    }
+    var label    = VS.utils.inflector.trim(this.label()),
+        remainder = this.get("app").options.remainder,
+        quoteFunction = (!_.contains(this.get("app").options.unquotable || [], category) && category != remainder) ? _.bind(this.quoteValue, this) : _.identity;
 
     if (category != remainder) {
-      category = category + ': ';
+      var res = category + ': ' + quoteFunction(label);
+      if (label != value) {
+        res += '('+ value +')';
+      }
+      return res;
     } else {
-      category = "";
+      return value;
     }
-    return category + value;
   },
   
   // Wrap categories that have spaces or any kind of quote with opposite matching
@@ -1831,7 +2453,7 @@ VS.model.SearchQuery = Backbone.Collection.extend({
   facets : function() {
     return this.map(function(facet) {
       var value = {};
-      value[facet.get('category')] = facet.get('value');
+      value[facet.category()] = facet.value();
       return value;
     });
   },
@@ -1840,32 +2462,31 @@ VS.model.SearchQuery = Backbone.Collection.extend({
   // is fine, but only the first is returned.
   find : function(category) {
     var facet = this.detect(function(facet) {
-      return facet.get('category').toLowerCase() == category.toLowerCase();
+      return facet.category().toLowerCase() == category.toLowerCase();
     });
-    return facet && facet.get('value');
+    return facet && facet.value();
   },
 
   // Counts the number of times a specific category is in the search query.
   count : function(category) {
     return this.select(function(facet) {
-      return facet.get('category').toLowerCase() == category.toLowerCase();
+      return facet.category().toLowerCase() == category.toLowerCase();
     }).length;
   },
 
   // Returns an array of extracted values from each facet in a category.
   values : function(category) {
     var facets = this.select(function(facet) {
-      return facet.get('category').toLowerCase() == category.toLowerCase();
+      return facet.category().toLowerCase() == category.toLowerCase();
     });
-    return _.map(facets, function(facet) { return facet.get('value'); });
+    return _.map(facets, function(facet) { return facet.value(); });
   },
 
   // Checks all facets for matches of either a category or both category and value.
   has : function(category, value) {
     return this.any(function(facet) {
-      var categoryMatched = facet.get('category').toLowerCase() == category.toLowerCase();
-      if (!value) return categoryMatched;
-      return categoryMatched && facet.get('value') == value;
+      var categoryMatched = facet.category().toLowerCase() == category.toLowerCase();
+      return categoryMatched && (!value || (facet.value() == value));
     });
   },
 
@@ -1873,7 +2494,7 @@ VS.model.SearchQuery = Backbone.Collection.extend({
   withoutCategory : function() {
     var categories = _.map(_.toArray(arguments), function(cat) { return cat.toLowerCase(); });
     return this.map(function(facet) {
-      if (!_.include(categories, facet.get('category').toLowerCase())) { 
+      if (!_.include(categories, facet.category().toLowerCase())) { 
         return facet.serialize();
       };
     }).join(' ');

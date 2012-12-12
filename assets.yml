@@ -16,6 +16,7 @@ javascripts:
   visualsearch:
     - lib/js/visualsearch.js
     - lib/js/views/*.js
+    - lib/js/parser/*.js
     - lib/js/utils/*.js
     - lib/js/models/*.js
     - lib/js/templates/*.jst
